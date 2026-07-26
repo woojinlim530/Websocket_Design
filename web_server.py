@@ -1,7 +1,9 @@
+#deprecated version
+
 import mimetypes
 import os
 import socket
-import struct
+import concurrent.futures
 from datetime import datetime, timezone
 import email.utils
 import threading
@@ -13,15 +15,10 @@ PORT = 8080
 BUFFER_SIZE = 8192
 ROOT_DIR = os.path.abspath('.')
 
-HEADER_FORMAT = '>III'
-HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
-FRAME_REQUEST = 1
-FRAME_RESPONSE = 2
-FRAME_RESPONSE_END = 3
-FRAME_ERROR = 4
+SOCKET_TIMEOUT = 10  # seconds for socket operations
 
 
-def make_response(status_code, status_text, body_content=b"", content_type="text/html; charset=utf-8", extra_headers=""):
+def make_response(status_code, status_text, body_content=b"", content_type="text/html; charset=utf-8", extra_headers="", connection_header="close"):
     if isinstance(body_content, str):
         body_bytes = body_content.encode('utf-8')
     else:
@@ -30,38 +27,14 @@ def make_response(status_code, status_text, body_content=b"", content_type="text
         f"HTTP/1.1 {status_code} {status_text}\r\n"
         f"Content-Type: {content_type}\r\n"
         f"Content-Length: {len(body_bytes)}\r\n"
-        "Connection: close\r\n"
+        f"Connection: {connection_header}\r\n"
         f"{extra_headers}"
         "\r\n"
     )
     return header.encode('utf-8') + body_bytes
 
 
-def read_exact(sock, size):
-    data = b""
-    while len(data) < size:
-        chunk = sock.recv(size - len(data))
-        if not chunk:
-            raise ConnectionError('Connection closed while reading')
-        data += chunk
-    return data
-
-
-class FramedSocket:
-    def __init__(self, sock):
-        self.sock = sock
-        self.send_lock = threading.Lock()
-
-    def recv_frame(self):
-        header = read_exact(self.sock, HEADER_SIZE)
-        length, frame_type, stream_id = struct.unpack(HEADER_FORMAT, header)
-        payload = read_exact(self.sock, length) if length else b""
-        return frame_type, stream_id, payload
-
-    def send_frame(self, frame_type, stream_id, payload=b""):
-        header = struct.pack(HEADER_FORMAT, len(payload), frame_type, stream_id)
-        with self.send_lock:
-            self.sock.sendall(header + payload)
+# Removed custom framing protocol and FramedSocket class per assignment requirements.
 
 
 def parse_http_request(payload):
@@ -101,15 +74,6 @@ def parse_http_date(value):
     except (TypeError, ValueError, IndexError, OverflowError):
         return None
 
-
-def is_http_request_start(data):
-    try:
-        text = data.decode('ascii', errors='ignore').upper()
-    except Exception:
-        return False
-    return any(text.startswith(method) for method in [
-        'GET ', 'HEAD ', 'POST ', 'PUT ', 'DELETE ', 'OPTIONS ', 'TRACE ', 'CONNECT '
-    ])
 
 
 def normalize_local_path(target):
@@ -202,83 +166,170 @@ def build_origin_request(method, path, version, headers, body, host_override):
     lines.append(f"Host: {host_override}")
     if body:
         lines.append(f"Content-Length: {len(body)}")
+    # Ask upstream to close to simplify proxying behavior
     lines.append('Connection: close')
     lines.append('')
     request_headers = '\r\n'.join(lines).encode('iso-8859-1') + b'\r\n'
     return request_headers + body
 
 
-def relay_origin_response(framed, stream_id, host, port, request_bytes):
+def relay_origin_plain(client_sock, host, port, request_bytes):
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as upstream:
+            upstream.settimeout(SOCKET_TIMEOUT)
             upstream.connect((host, port))
             upstream.sendall(request_bytes)
 
             while True:
-                chunk = upstream.recv(BUFFER_SIZE)
+                try:
+                    chunk = upstream.recv(BUFFER_SIZE)
+                except socket.timeout:
+                    break
                 if not chunk:
                     break
-                framed.send_frame(FRAME_RESPONSE, stream_id, chunk)
+                client_sock.sendall(chunk)
     except Exception as exc:
-        framed.send_frame(FRAME_ERROR, stream_id, f"Upstream proxy error: {exc}\n".encode('utf-8'))
-    finally:
-        framed.send_frame(FRAME_RESPONSE_END, stream_id)
+        try:
+            client_sock.sendall(make_response(502, 'Bad Gateway', f'<h1>502 Bad Gateway</h1>\n<p>{exc}</p>\n'))
+        except Exception:
+            pass
 
 
-def handle_request_stream(framed, stream_id, payload):
-    try:
-        method, target, version, headers, body = parse_http_request(payload)
-    except ValueError as exc:
-        framed.send_frame(FRAME_ERROR, stream_id, str(exc).encode('utf-8'))
-        framed.send_frame(FRAME_RESPONSE_END, stream_id)
+def handle_single_request(client_sock, client_addr, method, target, version, headers, body):
+    # Validate HTTP version
+    if version not in ('HTTP/1.0', 'HTTP/1.1'):
+        client_sock.sendall(make_response(505, 'HTTP Version Not Supported', '<h1>505 HTTP Version Not Supported</h1>\n'))
         return
 
-    if version != 'HTTP/1.1':
-        response_bytes = make_response(505, 'HTTP Version Not Supported', '<h1>505 HTTP Version Not Supported</h1>\n')
-        framed.send_frame(FRAME_RESPONSE, stream_id, response_bytes)
-        framed.send_frame(FRAME_RESPONSE_END, stream_id)
-        return
+    # Determine keep-alive semantics
+    conn_hdr = headers.get('connection', '')
+    keep_alive = False
+    if version == 'HTTP/1.1':
+        keep_alive = conn_hdr.lower() != 'close'
+    else:
+        keep_alive = conn_hdr.lower() == 'keep-alive'
 
     if target.startswith('http://') or target.startswith('https://'):
         try:
             host, port, path = resolve_origin(target, headers)
         except ValueError as exc:
-            framed.send_frame(FRAME_ERROR, stream_id, str(exc).encode('utf-8'))
-            framed.send_frame(FRAME_RESPONSE_END, stream_id)
+            client_sock.sendall(make_response(400, 'Bad Request', f'<h1>400 Bad Request</h1>\n<p>{exc}</p>\n', connection_header='close'))
             return
 
         request_bytes = build_origin_request(method, path, version, headers, body, host)
-        relay_origin_response(framed, stream_id, host, port, request_bytes)
+        relay_origin_plain(client_sock, host, port, request_bytes)
         return
 
-    response_bytes = build_local_response(method, target, version, headers)
-    framed.send_frame(FRAME_RESPONSE, stream_id, response_bytes)
-    framed.send_frame(FRAME_RESPONSE_END, stream_id)
+    # Build local response once
+    response = build_local_response(method, target, version, headers)
+    # Ensure connection header matches keep_alive
+    conn_value = 'keep-alive' if keep_alive else 'close'
+    # Insert connection header by replacing the default Connection: close in response
+    if b'Connection:' in response:
+        response = response.replace(b'Connection: close\r\n', f'Connection: {conn_value}\r\n'.encode('utf-8'), 1)
+    else:
+        # prepend connection header
+        header_end = response.find(b'\r\n\r\n')
+        if header_end != -1:
+            response = response[:header_end] + f'\r\nConnection: {conn_value}\r\n'.encode('utf-8') + response[header_end:]
+
+    client_sock.sendall(response)
 
 
-def handle_client(client_socket, client_address):
-    framed = FramedSocket(client_socket)
-    print(f"[{threading.current_thread().name}] Accepted connection from {client_address}", flush=True)
+def recv_http_request(client_sock):
+    # Read headers until CRLF CRLF
+    data = b''
+    while True:
+        try:
+            chunk = client_sock.recv(BUFFER_SIZE)
+        except socket.timeout:
+            raise ConnectionError('Socket read timed out while reading headers')
+        if not chunk:
+            raise ConnectionError('Connection closed by peer')
+        data += chunk
+        if b'\r\n\r\n' in data:
+            break
+        if len(data) > 10 * 1024 * 1024:
+            raise ValueError('Headers too large')
 
+    header_end = data.find(b'\r\n\r\n')
+    header_bytes = data[:header_end + 4]
+    remaining = data[header_end + 4:]
+
+    # Parse headers to check for Content-Length
+    method, target, version, headers, body = None, None, None, None, b''
+    try:
+        method, target, version, headers, body = parse_http_request(header_bytes + remaining)
+        return method, target, version, headers, body
+    except ValueError:
+        # Need to read body based on Content-Length
+        text = header_bytes.decode('iso-8859-1')
+        lines = text.split('\r\n')
+        cl = 0
+        for line in lines:
+            if line.lower().startswith('content-length:'):
+                try:
+                    cl = int(line.split(':', 1)[1].strip())
+                except Exception:
+                    cl = 0
+                break
+
+        need = cl - len(remaining)
+        while need > 0:
+            try:
+                chunk = client_sock.recv(min(BUFFER_SIZE, need))
+            except socket.timeout:
+                raise ConnectionError('Socket read timed out while reading body')
+            if not chunk:
+                raise ConnectionError('Connection closed while reading body')
+            remaining += chunk
+            need -= len(chunk)
+
+        return parse_http_request(header_bytes + remaining)
+
+
+def handle_connection(client_socket, client_address):
+    print(f"[{threading.current_thread().name}] Connection from {client_address}", flush=True)
+    client_socket.settimeout(SOCKET_TIMEOUT)
     try:
         while True:
-            frame_type, stream_id, payload = framed.recv_frame()
-            if frame_type != FRAME_REQUEST:
-                framed.send_frame(FRAME_ERROR, stream_id, b'Expected FRAME_REQUEST frame')
-                continue
+            try:
+                method, target, version, headers, body = recv_http_request(client_socket)
+            except ConnectionError:
+                break
+            except Exception as exc:
+                try:
+                    client_socket.sendall(make_response(400, 'Bad Request', f'<h1>400 Bad Request</h1>\n<p>{exc}</p>\n', connection_header='close'))
+                except Exception:
+                    pass
+                break
 
-            thread = threading.Thread(
-                target=handle_request_stream,
-                args=(framed, stream_id, payload),
-                daemon=True,
-            )
-            thread.start()
-    except ConnectionError:
-        pass
-    except Exception as e:
-        print(f"[Error handling client]: {e}", flush=True)
+            # Handle the single request synchronously
+            try:
+                handle_single_request(client_socket, client_address, method, target, version, headers, body)
+            except Exception as exc:
+                print(f"[Error handling request]: {exc}", flush=True)
+                break
+
+            # Determine whether to keep connection alive
+            conn_hdr = headers.get('connection', '')
+            if version == 'HTTP/1.1':
+                if conn_hdr.lower() == 'close':
+                    break
+                else:
+                    # keep-alive by default
+                    continue
+            else:
+                # HTTP/1.0
+                if conn_hdr.lower() == 'keep-alive':
+                    continue
+                else:
+                    break
     finally:
-        client_socket.close()
+        try:
+            client_socket.close()
+        except Exception:
+            pass
 
 # TCP socket gen
 server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -290,7 +341,17 @@ server_socket.listen(5) # backlog = 5
 
 print("listening on:", HOST, ":", PORT)
 
-while True:
-    client_socket, client_address = server_socket.accept()
-    client_thread = threading.Thread(target=handle_client, args=(client_socket, client_address), daemon=True)
-    client_thread.start()
+executor = concurrent.futures.ThreadPoolExecutor(max_workers=50)
+try:
+    while True:
+        client_socket, client_address = server_socket.accept()
+        # Submit the connection handler to the thread pool
+        executor.submit(handle_connection, client_socket, client_address)
+except KeyboardInterrupt:
+    print("Shutting down server", flush=True)
+finally:
+    executor.shutdown(wait=True)
+    try:
+        server_socket.close()
+    except Exception:
+        pass
