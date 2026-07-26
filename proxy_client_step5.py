@@ -78,7 +78,7 @@ def main():
     # Send two requests multiplexed
     req1 = make_req('/large.bin')
     send_frame(s, FRAME_REQUEST, 1, req1)
-    time.sleep(0.1)
+    time.sleep(0.0001)
     send_time = time.time()
     req2 = make_req('/small.txt')
     send_frame(s, FRAME_REQUEST, 2, req2)

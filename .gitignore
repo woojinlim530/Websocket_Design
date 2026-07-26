@@ -3,3 +3,6 @@ __pycache__/web_server_v1.cpython-313.pyc
 __pycache__/web_server_step5.cpython-313.pyc
 __pycache__/proxy_client.cpython-313.pyc
 __pycache__/proxy_client_step5.cpython-313.pyc
+compare_timing.py
+tmp_hol_test.py
+.vscode/settings.json
