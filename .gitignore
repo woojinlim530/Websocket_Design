@@ -6,3 +6,7 @@ __pycache__/proxy_client_step5.cpython-313.pyc
 compare_timing.py
 tmp_hol_test.py
 .vscode/settings.json
+proxy.log
+framed_test.log
+.DS_Store
+__pycache__/framed_test.cpython-313.pyc
